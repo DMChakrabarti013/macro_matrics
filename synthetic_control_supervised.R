@@ -1,15 +1,18 @@
-library(tidyverse)
-library(readr)    
-library(dplyr)    
-library(tidyr)    
-library(CVXR)     
-library(glmnet)   
-library(caret)    
-library(quadprog) 
+# 0) Dependencies -------------------------------------------------------------
+library(readr)    # read_csv
+library(dplyr)    # data wrangling
+library(tidyr)    # pivot_wider
+library(purrr)    # map_dfr
+library(CVXR)     # convex optimization
+library(glmnet)   # penalized regression
+library(caret)    # createFolds
+library(quadprog) # fallback QP
+library(zoo)      # as.yearqtr
+library(ggplot2)  # plotting
 
-# -----------------------------------------------------------------------------
-# 1. Read all CSVs (suppress column messages)
-# -----------------------------------------------------------------------------
+options(error = recover)
+
+# 1) Read CSVs (suppress col specs) ------------------------------------------
 baseline_df       <- read_csv("/Users/dwaipayanchakrabarti/Downloads/baseline_data_synthetic.csv", show_col_types = FALSE)
 coef_df           <- read_csv("/Users/dwaipayanchakrabarti/Downloads/bayesian_var_vectorized_coefficients.csv", show_col_types = FALSE)[,1:26]
 irf_df            <- read_csv("/Users/dwaipayanchakrabarti/Downloads/selected_irfs.csv", show_col_types = FALSE)
@@ -19,48 +22,52 @@ rf_df             <- read_csv("/Users/dwaipayanchakrabarti/Downloads/rf_proximit
 xgb_df            <- read_csv("/Users/dwaipayanchakrabarti/Downloads/xgboost_scores.csv", show_col_types = FALSE)
 gdp_panel         <- read_csv("/Users/dwaipayanchakrabarti/Downloads/gdp_growth_data.csv", show_col_types = FALSE)
 
-# -----------------------------------------------------------------------------
-# 2) Pivot GDP to state×quarter
-# -----------------------------------------------------------------------------
-gdp_wide <- gdp_panel %>%
-  mutate(YearQuarter = gsub("\\s+","", YearQuarter)) %>%
+# 2) Pivot GDP to state × quarter ---------------------------------------------
+gdp_wide <-
+  gdp_panel %>%
+  mutate(YearQuarter = gsub("\\s+", "", YearQuarter)) %>%  # "2005 Q2" → "2005Q2"
   group_by(State, YearQuarter) %>%
-  summarise(gdp_growth = mean(gdp_growth, na.rm=TRUE), .groups="drop") %>%
-  pivot_wider(id_cols = State,
-              names_from  = YearQuarter,
-              values_from = gdp_growth) %>%
+  summarise(gdp_growth = mean(gdp_growth, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(id_cols = State, names_from = YearQuarter, values_from = gdp_growth) %>%
   arrange(State) %>%
   as.data.frame()
 
 rownames(gdp_wide) <- gdp_wide$State
 gdp_wide$State    <- NULL
 
-# -----------------------------------------------------------------------------
-# 3) Aggregate covariates
-# -----------------------------------------------------------------------------
-baseline_cov <- baseline_df %>%
+# 3) Aggregate covariates ----------------------------------------------------
+baseline_df <- baseline_df %>%
+  mutate(
+    YQ = as.yearqtr(YearQuarter, format = "%Y Q%q")
+  )
+
+# then filter to pre‐treatment
+baseline_pre <- baseline_df %>%
+  filter(YQ < as.yearqtr("2008 Q3", "%Y Q%q"))
+
+baseline_cov <-
+  baseline_pre %>%
   group_by(State) %>%
   summarise(
-    assetquality_diff  = mean(assetquality_diff,  na.rm=TRUE),
-    low_diff           = mean(low_diff,           na.rm=TRUE),
-    profitability_diff = mean(profitability_diff, na.rm=TRUE),
-    .groups="drop"
-  )
+    assetquality_diff  = mean(assetquality_diff,  na.rm = TRUE),
+    low_diff           = mean(low_diff,           na.rm = TRUE),
+    profitability_diff = mean(profitability_diff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  as.data.frame()
 
-# -----------------------------------------------------------------------------
-# 4) Build ML‐scores table
-# -----------------------------------------------------------------------------
-ml_scores <- tibble(State = irf_df$State) %>%
+# 4) Build ML‐scores table ---------------------------------------------------
+ml_scores <-
+  tibble(State = irf_df$State) %>%
   mutate(
-    decision_tree_score = dt_df$G_score_tree[  match(State, dt_df$State)],
-    rf_score            = rf_df$G_score[       match(State, rf_df$State)],
-    gpr_score           = gpr_df$G_score[      match(State, gpr_df$State)],
-    xgb_score           = xgb_df$G_score[      match(State, xgb_df$State)]
-  )
+    decision_tree_score = dt_df$G_score_tree[ match(State, dt_df$State) ],
+    rf_score            = rf_df$G_score[       match(State, rf_df$State) ],
+    gpr_score           = gpr_df$G_score[      match(State, gpr_df$State) ],
+    xgb_score           = xgb_df$G_score[      match(State, xgb_df$State) ]
+  ) %>%
+  as.data.frame()
 
-# -----------------------------------------------------------------------------
-# 5) Filter  common states
-# -----------------------------------------------------------------------------
+# 5) Filter to common states -------------------------------------------------
 common_states <- Reduce(intersect, list(
   irf_df$State,
   coef_df$State,
@@ -69,123 +76,133 @@ common_states <- Reduce(intersect, list(
   rownames(gdp_wide)
 ))
 
-irf_df       <- filter(irf_df,       State %in% common_states)
-coef_df      <- filter(coef_df,      State %in% common_states)
-baseline_cov <- filter(baseline_cov, State %in% common_states)
-ml_scores    <- filter(ml_scores,    State %in% common_states)
-gdp_wide     <- gdp_wide[common_states, , drop=FALSE]
+irf_df       <- irf_df[ irf_df$State %in% common_states, ]
+coef_df      <- coef_df[ coef_df$State %in% common_states, ]
+baseline_cov <- baseline_cov[ baseline_cov$State %in% common_states, ]
+ml_scores    <- ml_scores[ ml_scores$State %in% common_states, ]
+gdp_wide     <- gdp_wide[common_states, , drop = FALSE]
 
-# -----------------------------------------------------------------------------
-# 6) Prepare numeric matrices
-# -----------------------------------------------------------------------------
-irf_mat      <- scale(data.matrix(irf_df[match(common_states, irf_df$State), -1]))
-coef_mat     <- scale(data.matrix(coef_df[match(common_states, coef_df$State), -1]))
-baseline_mat <- data.matrix(baseline_cov[match(common_states, baseline_cov$State), -1])
+# 6) Build numeric matrices --------------------------------------------------
+irf_mat      <- scale( data.matrix(irf_df[match(common_states, irf_df$State), -1]) )
+coef_mat     <- scale( data.matrix(coef_df[match(common_states, coef_df$State), -1]) )
+baseline_mat <- data.matrix(baseline_cov[ match(common_states, baseline_cov$State), -1 ])
 
-# ML‐scores -> numeric matrix
-dfm          <- as.data.frame(ml_scores %>% distinct(State, .keep_all=TRUE))
-rownames(dfm)<- dfm$State; dfm$State<-NULL
-dfm[]        <- lapply(dfm, function(col) as.numeric(as.character(col)))
-ml_mat       <- scale(data.matrix(dfm[common_states, , drop=FALSE]))
+# ML scores → scaled numeric matrix
+dfm       <- ml_scores %>% distinct(State, .keep_all = TRUE) %>% as.data.frame()
+rownames(dfm) <- dfm$State; dfm$State <- NULL
+dfm[]     <- lapply(dfm, function(col) as.numeric(as.character(col)))
+ml_mat    <- scale( data.matrix(dfm[common_states, , drop = FALSE]) )
 
-# -----------------------------------------------------------------------------
-# 7) Pre-treatment GDP (2005Q2–2008Q2)
-# -----------------------------------------------------------------------------
+# 7) Pre-treatment GDP (2005Q2–2008Q2) ---------------------------------------
 pre_cols <- which(colnames(gdp_wide) >= "2005Q2" & colnames(gdp_wide) <= "2008Q2")
-y_pre    <- gdp_wide[, pre_cols, drop=FALSE]
+y_pre     <- gdp_wide[, pre_cols, drop = FALSE]
 
-# -----------------------------------------------------------------------------
-# 8) SyntheticControlMatcher with fixed prepare_data()
-# -----------------------------------------------------------------------------
-SyntheticControlMatcher <- function(alpha=0.5, lambda_grid=10^seq(-1,2,10), gamma=0.5) {
-  state <- list(alpha=alpha, lambda_grid=lambda_grid, gamma=gamma)
+# =============================================================================
+# 8) SyntheticControlMatcher definition  (with corrected fit_predict)
+# =============================================================================
+SyntheticControlMatcher <- function(alpha = 0.5,
+                                    lambda_grid = 10^seq(-1, 2, length.out = 10),
+                                    gamma = 0.5) {
+  state <- list(alpha = alpha, lambda_grid = lambda_grid, gamma = gamma)
   
   prepare_data <- function(irfs, coeffs, baseline_data, ml_scores) {
-    state$states     <- irfs$State
-    state$irf_mat    <- scale(data.matrix(irfs  %>% select(-State)))
-    state$coef_mat   <- scale(data.matrix(coeffs %>% select(-State)))
+    state$states       <- irfs$State
+    state$irf_mat      <- scale( data.matrix(irfs  %>% select(-State)) )
+    state$coef_mat     <- scale( data.matrix(coeffs %>% select(-State)) )
     
-    # IRF weights
-    m  <- min(ncol(state$irf_mat), ncol(state$coef_mat))
-    cm <- tryCatch(cor(state$irf_mat[,1:m], state$coef_mat[,1:m]), error=function(e)NULL)
-    w  <- if(is.null(cm)) rep(1,m) else apply(abs(cm),1,max)
+    # IRF relevance weights
+    m   <- min(ncol(state$irf_mat), ncol(state$coef_mat))
+    cm  <- tryCatch(cor(state$irf_mat[,1:m], state$coef_mat[,1:m]), error = function(e) NULL)
+    w   <- if (is.null(cm)) rep(1, m) else apply(abs(cm), 1, max)
     w[is.na(w)] <- 1
     state$irf_weights <- w
     
-    # Baseline covariates -> numeric
+    # Baseline covariates → numeric matrix
     dfb <- baseline_data %>%
       select(State, assetquality_diff, low_diff, profitability_diff) %>%
-      group_by(State) %>%
-      summarise(across(everything(), ~mean(.x,na.rm=TRUE)), .groups="drop") %>%
       as.data.frame()
-    rownames(dfb) <- dfb$State; dfb$State<-NULL
+    rownames(dfb) <- dfb$State 
+    dfb$State <- NULL
     state$baseline_static <- data.matrix(dfb)
     
-    # ML scores -> numeric
-    dfm <- as.data.frame(ml_scores %>% distinct(State, .keep_all=TRUE))
-    rownames(dfm)<- dfm$State; dfm$State<-NULL
+    # ML scores → numeric matrix
+    dfm <- ml_scores %>% distinct(State, .keep_all = TRUE) %>% as.data.frame()
+    rownames(dfm) <- dfm$State; dfm$State <- NULL
     dfm[] <- lapply(dfm, function(col) as.numeric(as.character(col)))
-    state$ml_scores <- data.matrix(dfm[state$states, , drop=FALSE])
+    state$ml_scores <- data.matrix(dfm[state$states, , drop = FALSE])
     
     return(state)
   }
   
   optimize_ml_weights <- function(y_pre) {
-    y_mean <- rowMeans(y_pre[state$states,], na.rm=TRUE)
+    y_mean <- rowMeans(y_pre[state$states, ], na.rm = TRUE)
     X      <- scale(state$ml_scores)
-    cv     <- tryCatch(cv.glmnet(X,y_mean,alpha=0,lower.limits=0), error=function(e)NULL)
-    w      <- if(is.null(cv)) {
-      rep(1,ncol(X))
+    cv     <- tryCatch(cv.glmnet(X, y_mean, alpha = 0, lower.limits = 0), error = function(e) NULL)
+    w      <- if (is.null(cv)) {
+      rep(1, ncol(X))
     } else {
-      co<-as.vector(coef(cv,s="lambda.min"))[-1]
-      if(sum(co)<=0) rep(1,length(co)) else co
+      co <- as.vector(coef(cv, s = "lambda.min"))[-1]
+      if (sum(co) <= 0) rep(1, length(co)) else co
     }
-    w<- w/sum(w); names(w)<-colnames(state$ml_scores)
+    w <- w / sum(w)
+    names(w) <- colnames(state$ml_scores)
     state$ml_weights <- w
-    w
+    return(w)
   }
   
   combine_delta <- function() {
-    m     <- min(ncol(state$irf_mat), ncol(state$coef_mat))
-    I     <- state$irf_mat[,1:m]
-    C     <- state$coef_mat[,1:m]
-    sweep(state$alpha*I + (1-state$alpha)*C, 2, state$irf_weights[1:m], "*")
+    m <- min(ncol(state$irf_mat), ncol(state$coef_mat))
+    I <- state$irf_mat[,1:m]
+    C <- state$coef_mat[,1:m]
+    sweep(state$alpha * I + (1 - state$alpha) * C, 2, state$irf_weights[1:m], "*")
   }
   
   compute_cv_error <- function(G) {
-    if(length(unique(G))<2) return(0)
-    folds<-createFolds(G,k=min(5,length(G)-1)); errs<-c()
+    if (length(unique(G)) < 2) return(0)
+    folds <- createFolds(G, k = min(5, length(G)-1))
+    errs  <- c()
     for(tr in folds) {
-      te<-setdiff(seq_along(G),tr)
-      if(length(unique(G[tr]))<2) next
-      fit<-glm(G[tr]~.,data=as.data.frame(state$ml_scores)[tr,],family="binomial")
-      p  <-predict(fit, as.data.frame(state$ml_scores)[te,],type="response")
-      errs<-c(errs,mean((p>0.5)!=G[te]))
+      te <- setdiff(seq_along(G), tr)
+      if (length(unique(G[tr])) < 2) next
+      fit   <- glm(G[tr] ~ ., data = as.data.frame(state$ml_scores)[tr, ], family = "binomial")
+      pred  <- predict(fit,  as.data.frame(state$ml_scores)[te, ], type = "response")
+      errs  <- c(errs, mean((pred > 0.5) != G[te]))
     }
-    if(length(errs)==0) 0 else mean(errs)
+    if (length(errs) == 0) 0 else mean(errs)
   }
   
-  synth_weights <- function(d_i,d_j,o_i,o_j,lam) {
-    J<-nrow(d_j); wv<-Variable(J)
-    obj <- sum_squares(d_i - t(d_j) %*% wv) +
-      lam * sum_squares(o_i - t(o_j) %*% wv)
-    pr<-Problem(Minimize(obj),list(wv>=0,sum(wv)==1))
-    sol<-tryCatch(solve(pr),error=function(e)NULL)
-    if(!is.null(sol)&&sol$status%in%c("optimal","optimal_inaccurate"))
+  synth_weights <- function(d_i, d_j, o_i, o_j, lam) {
+    J  <- nrow(d_j)
+    wv <- CVXR::Variable(J)
+    
+    obj <- CVXR::sum_squares(d_i - t(d_j) %*% wv) +
+      lam * CVXR::sum_squares(o_i - t(o_j) %*% wv)
+    
+    pr  <- CVXR::Problem(CVXR::Minimize(obj),
+                         list(wv >= 0, sum(wv) == 1))
+    sol <- tryCatch(CVXR::solve(pr), error = function(e) NULL)
+    if (!is.null(sol) &&
+        sol$status %in% c("optimal","optimal_inaccurate")) {
       return(as.numeric(sol$getValue(wv)))
-    D<-t(d_j)%*%d_j+lam*(t(o_j)%*%o_j); d<-as.vector(t(d_j)%*%d_i+lam*(t(o_j)%*%o_i))
-    ev<-eigen(D,symmetric=TRUE,only.values=TRUE)$values
-    if(min(ev)<=0) D<-D+diag(J)*(abs(min(ev))+1e-6)
-    solve.QP(D,d,cbind(rep(1,J),diag(J)),c(1,rep(0,J)),meq=1)$solution
+    }
+    
+    # fallback QP:
+    D <- t(d_j) %*% d_j + lam * (t(o_j) %*% o_j)
+    d <- as.vector(t(d_j) %*% d_i + lam * (t(o_j) %*% o_i))
+    ev <- eigen(D, symmetric=TRUE, only.values=TRUE)$values
+    if (min(ev) <= 0) D <- D + diag(nrow(D))*(abs(min(ev))+1e-6)
+    
+    solve.QP::solve.QP(D, d,
+                       cbind(rep(1,J), diag(J)),
+                       c(1, rep(0,J)),
+                       meq = 1)$solution
   }
   
   optimize_lambda <- function(combined, y_pre, G) {
     cv_err <- compute_cv_error(G)
     best   <- list(loss = Inf, lam = state$lambda_grid[1])
-    
     for (lam in state$lambda_grid) {
       errs <- c()
-      
       for (i in which(G == 1)) {
         donors <- which(G == 0)
         d_i    <- combined[i, ]
@@ -194,87 +211,92 @@ SyntheticControlMatcher <- function(alpha=0.5, lambda_grid=10^seq(-1,2,10), gamm
         o_j    <- state$baseline_static[donors, , drop = FALSE]
         w      <- synth_weights(d_i, d_j, o_i, o_j, lam)
         if (length(w) != length(donors)) next
-        
         y_i <- as.numeric(y_pre[i, ])
         y_d <- as.matrix(y_pre[donors, , drop = FALSE])
-        
-        # Append the squared‐error for this i
-        errs <- c(
-          errs,
-          mean((y_i - as.numeric(t(w) %*% y_d))^2, na.rm = TRUE)
-        )
+        errs <- c(errs, mean((y_i - as.numeric(t(w) %*% y_d))^2, na.rm = TRUE))
       }
-      
       pre_err <- if (length(errs) == 0) Inf else mean(errs)
       loss    <- state$gamma * pre_err + (1 - state$gamma) * cv_err
-      
       if (loss < best$loss) {
         best$loss <- loss
         best$lam  <- lam
       }
     }
-    
-    best$lam
+    return(best$lam)
   }
   
-  fit_predict <- function(irfs,coeffs,baseline_data,ml_scores,y_pre,y_full,T0) {
-    state<<-prepare_data(irfs,coeffs,baseline_data,ml_scores)
-    ml_w <- optimize_ml_weights(y_pre)
-    
-    # 2) keep ML weights in state for later reference
+  fit_predict <- function(irfs, coeffs, baseline_data, ml_scores, y_pre, y_full, T0) {
+    state <<- prepare_data(irfs, coeffs, baseline_data, ml_scores)
+    ml_w   <- optimize_ml_weights(y_pre)
     state$ml_weights <- ml_w
     
-    # 3) form the composite score using returned weights
     delta <- combine_delta()
     
+    # composite ML score → grouping
+    comp <- as.vector(scale(state$ml_scores) %*% ml_w)
+    state$c_threshold <- median(comp, na.rm = TRUE)
+    G <- as.integer(comp > state$c_threshold)
     
+    lam <- optimize_lambda(delta, y_pre, G)
     
-    comp  <- as.vector(scale(state$ml_scores) %*% ml_w)
-    state$c_threshold <- median(comp,na.rm=TRUE)
-    G     <- as.integer(comp>state$c_threshold)
-    lam   <- optimize_lambda(delta,y_pre,G)
-    cf<-list(); te<-list()
-    for(i in which(G==1)) {
-      donors<-which(G==0)
-      w<-synth_weights(delta[i,],delta[donors,],state$baseline_static[i,],state$baseline_static[donors,],lam)
-      y_o<-as.numeric(y_full[i,]); y_d<-as.matrix(y_full[donors,])
-      y_s <- as.numeric(t(w) %*% y_d)
-      cf[[common_states[i]]] <- list(
-        observed= setNames(y_o,colnames(y_full)),
-        synthetic=setNames(as.numeric(y_s),colnames(y_full)),
-        weights= setNames(w,common_states[donors])
-      )
-      eff<-setNames(y_o-as.numeric(y_s), colnames(y_full))
+    cf <- list(); te <- list()
+    for (i in which(G == 1)) {
+      donors <- which(G == 0)
       
-      t0<-which(colnames(y_full)==T0)
-      t0<-ifelse(length(t0)==0,floor(ncol(y_full)/2),t0)
+      # observed & synthetic series
+      y_o      <- as.numeric(y_full[i, ])
+      names(y_o) <- colnames(y_full)
+      Y_d_mat  <- as.matrix(y_full[donors, , drop = FALSE])
+      y_s_vals <- as.numeric(t( synth_weights(delta[i,], delta[donors,], 
+                                              state$baseline_static[i,], 
+                                              state$baseline_static[donors,], 
+                                              lam) ) %*% Y_d_mat)
+      names(y_s_vals) <- colnames(y_full)
       
+      # full effect & split
+      eff_full     <- y_o - y_s_vals
+      t0_idx       <- which(colnames(y_full) == T0)
+      if (length(t0_idx) == 0) t0_idx <- floor(length(eff_full)/2)
+      active_eff     <- eff_full[ t0_idx:length(eff_full) ]
+      cumulative_eff <- cumsum(active_eff)
       
-      post_q      <- colnames(y_full)[t0:length(eff)]
-      active_eff  <- eff[post_q]
-      cum_eff     <- cumsum(active_eff)
-      te[[common_states[i]]] <- list(
-        active     = setNames(active_eff, post_q),
-        cumulative = setNames(cum_eff,    post_q)
+      cf[[ common_states[i] ]] <- list(
+        observed  = setNames(y_o,      colnames(y_full)),
+        synthetic = setNames(y_s_vals, colnames(y_full)),
+        weights   = setNames(
+          synth_weights(delta[i,], delta[donors,], 
+                        state$baseline_static[i,], 
+                        state$baseline_static[donors,], lam),
+          common_states[donors]
         )
+      )
+      te[[ common_states[i] ]] <- list(
+        active     = setNames(active_eff,     colnames(y_full)[t0_idx:length(eff_full)]),
+        cumulative = setNames(cumulative_eff, colnames(y_full)[t0_idx:length(eff_full)])
+      )
     }
+    
     list(
-      alpha=state$alpha, lambda=lam, gamma=state$gamma,
-      c_threshold=state$c_threshold, ml_weights=state$ml_weights,
-      groups=G, counterfactuals=cf, treatment_effects=te,
-      treated_states=names(cf), donor_states=common_states[G==0]
+      alpha            = state$alpha,
+      lambda           = lam,
+      gamma            = state$gamma,
+      c_threshold      = state$c_threshold,
+      ml_weights       = state$ml_weights,
+      groups           = G,
+      counterfactuals  = cf,
+      treatment_effects= te,
+      treated_states   = names(cf),
+      donor_states     = common_states[G == 0]
     )
   }
   
-  list(fit_predict=fit_predict)
+  list(fit_predict = fit_predict)
 }
 
-# -----------------------------------------------------------------------------
-# 9) Run the matcher
-# -----------------------------------------------------------------------------
+# 9) Run the SCM --------------------------------------------------------------
 alpha           <- 0.5
 gamma           <- 0.5
-lambda_grid     <- 10^seq(-1,2,length.out=10)
+lambda_grid     <- 10^seq(-1, 2, length.out = 10)
 treatment_start <- "2008Q3"
 
 scm     <- SyntheticControlMatcher(alpha, lambda_grid, gamma)
@@ -282,45 +304,43 @@ results <- scm$fit_predict(irf_df, coef_df, baseline_cov, ml_scores,
                            y_pre, gdp_wide, treatment_start)
 
 message("Optimal λ = ", results$lambda)
-message("Treated states: ", paste(results$treated_states, collapse=", "))
-message("Donor states:   ", paste(results$donor_states,   collapse=", "))
+message("Treated states: ", paste(results$treated_states, collapse = ", "))
+message("Donor states:   ", paste(results$donor_states, collapse = ", "))
 
-
-############ results #########
+######## results ##########
 library(zoo)
 
-obs <- results$counterfactuals$texas$observed
-syn <- results$counterfactuals$texas$synthetic
+obs <- results$counterfactuals$maryland$observed
+syn <- results$counterfactuals$maryland$synthetic
 qtr <- names(obs)
 
 # convert "2005Q2" → yearqtr
-obs <- results$counterfactuals$texas$observed
-syn <- results$counterfactuals$texas$synthetic
+obs <- results$counterfactuals$maryland$observed
+syn <- results$counterfactuals$maryland$synthetic
 qtr <- names(obs)
 
 # numeric indices for x
 ix <- seq_along(obs)
 
-plot(ix, obs, type="b", col="black", pch=16,
+plot(ix, obs, type="l", col="black", pch=16,
      xaxt="n",                    # suppress default x‐axis
      xlab="Quarter", ylab="GDP Growth",
-     main="Texas: Observed vs Synthetic")
-lines(ix, syn, type="b", col="blue", pch=17)
+     main="Maryland: Observed vs Synthetic")
+lines(ix, syn, type="l", col="blue", pch=17)
 
 # add our own x‐axis with labels
 axis(1, at=ix, labels=qtr, las=2, cex.axis=0.7)  
 
 # vertical line at treatment
 t0 <- which(qtr=="2008Q3")
+t1 <- which(qtr=='2017Q1')
 abline(v=t0, lty=2)
+abline(v=t1, lty=2)
 
 legend("topleft", legend=c("Observed","Synthetic"),
        col=c("black","blue"), pch=c(16,17), bty="n")
 
-
-
-
-
+######### all results ######
 library(ggplot2)
 library(zoo)
 library(reshape2)
@@ -350,14 +370,19 @@ all_long <- melt(all_df,
 all_long$Date <- as.yearqtr(gsub("Q", " ", all_long$Quarter), format = "%Y %q")
 
 # 4) Plot 
+end_qtr <- as.yearqtr("2017 Q2", "%Y Q%q")
+
 ggplot(all_long, aes(x = Date, y = Value, color = Type)) +
   geom_line(size = 0.7) +
   facet_wrap(~ State, ncol = 5) +
-  geom_vline(xintercept = as.yearqtr("2008 Q3", "%Y %q"), linetype = "dashed", alpha = 0.5) +
+  geom_vline(xintercept = as.yearqtr("2008 Q3", "%Y %q"),
+             linetype = "dashed", alpha = 0.5) +
+  scale_x_yearqtr(format = "%Y Q%q",
+                  limits = c(min(all_long$Date), end_qtr)) +
   theme_minimal() +
   theme(
-    axis.text.x = element_text(angle = 45, hjust = 1, size = 6),
-    strip.text  = element_text(size = 8),
+    axis.text.x    = element_text(angle = 45, hjust = 1, size = 6),
+    strip.text     = element_text(size = 8),
     legend.position = "bottom"
   ) +
   labs(
@@ -366,61 +391,3 @@ ggplot(all_long, aes(x = Date, y = Value, color = Type)) +
     color = NULL,
     title = "Observed vs Synthetic GDP Growth by State"
   )
-
-
-
-####### cumulative effects ########
-library(dplyr)
-library(purrr)
-
-
-cumulative_effects_df <- map_dfr(
-  results$treatment_effects,
-  ~ {
-    # .x is a list with $active (vector) and $cumulative (vector)
-    tibble(
-      Quarter        = names(.x$active),
-      TE_Active      = as.numeric(.x$active),
-      TE_Cumulative  = as.numeric(.x$cumulative)
-    )
-  },
-  .id = "State"
-)
-
-sums_df <- cumulative_effects_df %>%
-  group_by(State) %>%
-  summarise(
-    sum_active      = sum(TE_Active,     na.rm = TRUE),
-    sum_cumulative  = sum(TE_Cumulative, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-# Inspect
-sums_df
-
-
-######### fit metrics #######
-
-t0_idx   <- which(colnames(gdp_wide) == treatment_start)
-if (length(t0_idx)==0) stop("treatment_start not in colnames(gdp_wide)")
-pre_idxs <- seq_len(t0_idx-1)   # all quarters *before* the start
-
-# 2) for each treated state, compute MSE & RMSE over pre‐treatment
-fit_metrics <- map_dfr(
-  names(results$counterfactuals),    # iterate over each treated state
-  function(st) {
-    cf  <- results$counterfactuals[[st]]
-    obs <- cf$observed[ pre_idxs ]
-    syn <- cf$synthetic[pre_idxs ]
-    se  <- (obs - syn)^2
-    mse <- mean(se, na.rm=TRUE)
-    tibble(
-      State = st,
-      MSE   = mse,
-      RMSE  = sqrt(mse)
-    )
-  }
-)
-
-# 3) inspect
-print(fit_metrics)
